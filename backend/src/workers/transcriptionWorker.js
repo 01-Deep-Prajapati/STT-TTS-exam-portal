@@ -15,7 +15,11 @@ const StudentAnswer = require("../models/StudentAnswer");
 const connection = require("../config/redis");
 const connectDB = require("../config/db");
 const answersEvaluationQueue = require("../queues/answersEvaluationQueue");
-const { s3Client, BUCKET_NAME } = require("../config/s3");
+const {
+  s3Client,
+  BUCKET_NAME,
+  generatePresignedDownloadUrl,
+} = require("../config/s3");
 const { GetObjectCommand } = require("@aws-sdk/client-s3");
 
 // ✅ Connect MongoDB for worker process
@@ -25,6 +29,42 @@ console.log("🚀 Transcription Worker started");
 
 // Helper function for delays
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Create a new short-lived R2 download URL from the bucket/key in a stored URL.
+ * Saved R2 URLs are presigned and expire, but their path still identifies the object.
+ */
+async function refreshR2DownloadUrl(storedUrl) {
+  const parsedUrl = new URL(storedUrl);
+  if (!parsedUrl.hostname.endsWith(".r2.cloudflarestorage.com")) {
+    return null;
+  }
+
+  if (!BUCKET_NAME) {
+    throw new Error("R2_BUCKET_NAME environment variable is not set");
+  }
+
+  const pathParts = decodeURIComponent(parsedUrl.pathname)
+    .split("/")
+    .filter(Boolean);
+  if (pathParts[0] !== BUCKET_NAME || pathParts.length < 2) {
+    throw new Error(
+      "Stored R2 URL does not contain the configured bucket and object key",
+    );
+  }
+
+  const objectKey = pathParts.slice(1).join("/");
+  const freshUrl = await generatePresignedDownloadUrl(objectKey);
+  return { url: freshUrl, objectKey };
+}
+
+function getAudioExtension(audioUrl) {
+  try {
+    return path.extname(new URL(audioUrl).pathname).toLowerCase();
+  } catch {
+    return path.extname(audioUrl.split("?")[0]).toLowerCase();
+  }
+}
 
 /**
  * Convert audio buffer to MP3 format
@@ -104,7 +144,7 @@ async function transcribeAudio(audioBuffer, filename = "audio.wav") {
     //   `🌐 Calling STT API: https://jaunita-untempering-nita.ngrok-free.dev/api/v1/stt/transcribe`,
     // );
     // console.log(`📁 Audio filename: ${filename}`);
-    // 
+    //
     // const response = await axios.post(
     //   "https://jaunita-untempering-nita.ngrok-free.dev/api/v1/stt/transcribe",
     //   formData,
@@ -126,7 +166,6 @@ async function transcribeAudio(audioBuffer, filename = "audio.wav") {
         timeout: 60000, // 60 second timeout
       },
     );
-
 
     console.log(`✅ STT API Response:`, response.data);
 
@@ -172,7 +211,7 @@ new Worker(
           console.log(`     - Answer ID: ${a._id}`);
           console.log(`       questionId: ${a.questionId}`);
           console.log(
-            `       recordingUrls: ${JSON.stringify(a.recordingUrls)}`,
+            `       recording count: ${a.recordingUrls?.length || 0}`,
           );
         });
       }
@@ -208,7 +247,7 @@ new Worker(
 
           // Get the first recording URL (usually only one per question)
           const audioUrl = answer.recordingUrls[0];
-          console.log(`📁 Audio URL: ${audioUrl}`);
+          const audioExtension = getAudioExtension(audioUrl);
 
           let audioBuffer;
 
@@ -219,8 +258,22 @@ new Worker(
           ) {
             console.log(`☁️ Fetching audio from S3/remote URL...`);
             try {
-              // Check if it's an S3 URL
-              if (
+              // Saved R2 URLs are temporary; derive the object key and sign a fresh GET URL now.
+              const refreshedR2 = await refreshR2DownloadUrl(audioUrl);
+              if (refreshedR2) {
+                console.log(
+                  "🔐 Detected Cloudflare R2 object; generated a fresh download URL.",
+                );
+                const response = await axios.get(refreshedR2.url, {
+                  responseType: "arraybuffer",
+                  timeout: 30000,
+                });
+                audioBuffer = Buffer.from(response.data);
+                console.log(
+                  `📊 Audio fetched from R2 object ${refreshedR2.objectKey}. Size: ${audioBuffer.length} bytes`,
+                );
+              } else if (
+                // Check if it's an AWS S3 URL
                 audioUrl.includes("s3.ap-south-1.amazonaws.com") ||
                 audioUrl.includes("s3.amazonaws.com") ||
                 audioUrl.includes(`amazonaws.com/${BUCKET_NAME}`)
@@ -258,7 +311,7 @@ new Worker(
 
                   console.log(`🔑 Final S3 key: ${s3Key}`);
                 } catch (urlError) {
-                  console.error(`❌ Invalid S3 URL: ${audioUrl}`);
+                  console.error(`❌ Invalid S3 URL: ${urlError.message}`);
                   throw new Error(`Invalid S3 URL format: ${urlError.message}`);
                 }
 
@@ -327,7 +380,9 @@ new Worker(
           }
           // Unknown URL format
           else {
-            console.error(`❌ Invalid audio URL format: ${audioUrl}`);
+            console.error(
+              "❌ Invalid audio URL format; URL value was redacted.",
+            );
             answer.sttStatus = "failed";
             answer.sttError =
               "Invalid audio URL format - must be S3 URL or /uploads/ path";
@@ -345,7 +400,7 @@ new Worker(
           let finalAudioBuffer = audioBuffer;
           let audioFilename = "audio.mp3";
 
-          if (audioUrl.endsWith(".webm")) {
+          if (audioExtension === ".webm") {
             console.log(`🔄 Converting webm to mp3...`);
             try {
               finalAudioBuffer = await convertToMp3(audioBuffer);
@@ -363,11 +418,13 @@ new Worker(
               failureCount++;
               continue;
             }
-          } else if (audioUrl.endsWith(".mp3")) {
+          } else if (audioExtension === ".mp3") {
             audioFilename = "audio.mp3";
           } else {
             // For other formats, try converting to mp3
-            console.log(`🔄 Converting ${audioUrl.split(".").pop()} to mp3...`);
+            console.log(
+              `🔄 Converting ${audioExtension || "unknown format"} to mp3...`,
+            );
             try {
               finalAudioBuffer = await convertToMp3(audioBuffer);
               console.log(
@@ -434,6 +491,14 @@ new Worker(
       console.log(
         `\n📊 Transcription results: ${successCount} succeeded, ${failureCount} failed`,
       );
+
+      if (failureCount > 0) {
+        attempt.status = "submitted";
+        await attempt.save();
+        throw new Error(
+          `Transcription failed for ${failureCount} answer(s); evaluation was not queued so failed audio is not graded as zero.`,
+        );
+      }
 
       // ✅ Step 4: Update attempt status to "transcribed"
       console.log(`📤 Updating attempt status to "transcribed"...`);

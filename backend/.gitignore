@@ -83,6 +83,9 @@ web_modules/
 .env.production.local
 .env.local
 
+# Exam retry snapshots contain student submissions and must stay local.
+/backups/
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
