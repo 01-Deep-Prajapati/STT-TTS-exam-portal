@@ -1134,6 +1134,28 @@ router.post(
         return res.status(400).json({ message: "Cannot publish results before the exam has ended" });
       }
 
+      const totalAttempts = await StudentExamAttempt.countDocuments({ examId });
+      const evaluatedAttempts = await StudentExamAttempt.countDocuments({
+        examId,
+        status: "evaluated",
+      });
+      const failedAnswersCount = await StudentAnswer.countDocuments({
+        examId,
+        $or: [
+          { sttStatus: "failed" },
+          { evaluationStatus: "failed" },
+          { evaluationFeedback: { $regex: /FastAPI error|Fallback also failed/i } },
+        ],
+      });
+
+      if (totalAttempts > 0 && (evaluatedAttempts !== totalAttempts || failedAnswersCount > 0)) {
+        return res.status(400).json({
+          message: "Cannot publish results until every submission is evaluated without failures.",
+          allEvaluated: evaluatedAttempts === totalAttempts,
+          hasFailures: failedAnswersCount > 0,
+        });
+      }
+
       // Set resultsPublished flag to true
       exam.resultsPublished = true;
       exam.resultPublishedAt = new Date();

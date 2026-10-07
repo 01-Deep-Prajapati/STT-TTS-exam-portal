@@ -998,6 +998,7 @@ export async function getExamEvaluationStatus(examId: string): Promise<{
   totalAttempts: number
   evaluatedAttempts: number
   pendingAttempts: number
+  hasFailures: boolean
   resultsPublished: boolean
   message: string
 }> {
